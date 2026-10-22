@@ -1,0 +1,271 @@
+"use strict";
+// Browser half. Reads the session's `tokenUsage` projection, prices it with the
+// currently selected model's models.dev tariff, and shows it in the composer dock.
+var React = require("react");
+var h = React.createElement;
+var ReactDOM = require("react-dom");
+var prim = require("@deepseek-ai/dsh-client-ui-primitives");
+
+// Pricing lives on the host: the `sessionCost` projection (lib/index.js) folds the session log into
+// per-model token buckets and prices them from models.dev, so each request is billed at the model
+// that actually answered. This half only aggregates the session tree (subagents) and renders it.
+
+// Sum model rows ({provider, model, input, output, cacheRead, cacheWrite, price, cost}) by model.
+function mergeRows(rows) {
+  var by = {};
+  rows.forEach(function (r) {
+    var k = r.provider + "/" + r.model;
+    var e = by[k];
+    if (!e) e = by[k] = { provider: r.provider, model: r.model, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, price: r.price, cost: r.cost };
+    else if (e.cost === null || r.cost === null) e.cost = null;
+    else e.cost += r.cost;
+    e.input += r.input; e.output += r.output; e.cacheRead += r.cacheRead; e.cacheWrite += r.cacheWrite;
+  });
+  return Object.keys(by).map(function (k) { return by[k]; }).sort(function (a, b) { return (b.cost || 0) - (a.cost || 0); });
+}
+
+function sumCost(rows) {
+  var total = 0, unpriced = false;
+  rows.forEach(function (r) { if (r.cost === null) unpriced = true; else total += r.cost; });
+  return { total: total, unpriced: unpriced };
+}
+
+// Walk the subagent tree. `valuesOf(id)` returns that session's projection values (or undefined when
+// not loaded). Returns the root's rows, all descendants' rows, and what could not be counted.
+function collectTree(rootValues, valuesOf) {
+  var own = rootValues && rootValues.sessionCost ? rootValues.sessionCost.models : [];
+  var subs = [], pending = [], external = 0, count = 0, seen = {};
+  (function walk(values) {
+    ((values && values.subagentCatalog) || []).forEach(function (entry) {
+      if (seen[entry.id]) return;
+      seen[entry.id] = true;
+      if (entry.mode === "external") { external++; return; }
+      count++;
+      var v = valuesOf(entry.id);
+      if (!v || !v.sessionCost) { pending.push(entry.id); return; }
+      subs = subs.concat(v.sessionCost.models);
+      walk(v);
+    });
+  })(rootValues);
+  return { own: own, subs: subs, pending: pending, external: external, count: count };
+}
+
+function usd(n) {
+  return "$" + (n || 0).toFixed(2);
+}
+
+function fmtN(n) {
+  n = n || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e4) return (n / 1e3).toFixed(1) + "k";
+  return String(n);
+}
+function fmtMs(ms) {
+  var s = Math.round((ms || 0) / 1000);
+  if (s < 60) return s + "s";
+  var m = Math.floor(s / 60);
+  if (m < 60) return m + "m " + (s % 60) + "s";
+  return Math.floor(m / 60) + "h " + (m % 60) + "m";
+}
+
+var T = "var(--dsw-alias-label-tertiary)";
+var S = {
+  root: { boxSizing: "border-box", display: "flex", justifyContent: "center", minWidth: 0,
+    fontSize: "calc(var(--dsh-content-font-size-secondary,13px) - 1px)", lineHeight: "20px" },
+  anchor: { minWidth: 0, display: "inline-flex" },
+  // Mirrors the native stat dialog (ui-chat stat-dialog.module.css).
+  panel: { zIndex: 1100, boxSizing: "border-box", position: "fixed", width: "max-content",
+    minWidth: "min(300px, 100vw - 24px)", maxWidth: "min(440px, 100vw - 24px)", padding: 16, fontSize: 12, lineHeight: "18px",
+    borderRadius: "var(--dsw-radius-lg)", background: "var(--dsw-specific-menu)", backdropFilter: "var(--dsw-menu-backdrop-filter)",
+    "--dsw-elevation-stroke-color": "var(--dsw-alias-border-l1)", boxShadow: "var(--dsw-elevation-prominent)",
+    color: "var(--dsw-alias-label-secondary)", cursor: "default", border: 0 },
+  measure: { visibility: "hidden", left: 0, top: 0 },
+  title: { display: "flex", justifyContent: "space-between", gap: 16, marginBottom: 8, fontWeight: 500,
+    color: "var(--dsw-alias-label-primary)" },
+  titleLabel: { display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0 },
+  rule: { borderTop: ".5px solid var(--dsw-alias-border-l2)", margin: "0 0 10px" },
+  num: { fontVariantNumeric: "tabular-nums" },
+  table: { width: "100%", borderCollapse: "collapse", fontVariantNumeric: "tabular-nums", marginBottom: 10 },
+  th: { textAlign: "right", fontWeight: 400, color: T, padding: "0 0 4px 12px" },
+  td: { textAlign: "right", padding: "2px 0 2px 12px", color: "var(--dsw-alias-label-secondary)" },
+  tl: { textAlign: "left", padding: "2px 0", color: T },
+  tfoot: { borderTop: ".5px solid var(--dsw-alias-border-l2)" },
+  details: { display: "grid", gridTemplateColumns: "minmax(76px, auto) minmax(0, 1fr)", gap: "6px 16px", margin: 0, color: T },
+  dd: { margin: 0, minWidth: 0, textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--dsw-alias-label-secondary)",
+    overflowWrap: "anywhere" },
+  dt: { margin: 0, minWidth: 0 },
+  note: { marginTop: 10, color: T }
+};
+
+
+// Hover/pressed states need real CSS (inline styles cannot express :hover). Mirrors the native
+// StatsPills pill (ui-chat StatsPills.module.css).
+var CSS = [
+  ".dsh-cost-pill{box-sizing:border-box;display:inline-flex;align-items:center;gap:6px;max-width:100%;",
+  "padding:1px 8px;border:none;border-radius:999px;background:transparent;cursor:pointer;font:inherit;",
+  "line-height:inherit;white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-tertiary)}",
+  ".dsh-cost-pill svg{flex:none;width:14px;height:14px}",
+  ".dsh-cost-pill:hover,.dsh-cost-pill[aria-expanded=true]{background:var(--dsw-alias-interactive-bg-hover);",
+  "color:var(--dsw-alias-label-secondary)}",
+  ".dsh-cost-pill:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid ",
+  "var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:-2px}"
+].join("");
+
+// Coin icon in the native style: 16x16 viewBox, 1px stroke, currentColor, drawn at 14px.
+function CoinIcon() {
+  var line = { stroke: "currentColor", strokeLinecap: "round", strokeLinejoin: "round" };
+  return h("svg", { width: 14, height: 14, viewBox: "0 0 16 16", fill: "none", strokeWidth: 1,
+      xmlns: "http://www.w3.org/2000/svg", "aria-hidden": "true", style: { flex: "none" } },
+    h("circle", { cx: 8, cy: 8, r: 6.5, stroke: "currentColor" }),
+    h("path", Object.assign({ d: "M10.2 6.3C10.2 5.5 9.3 5 8 5C6.7 5 5.8 5.5 5.8 6.4C5.8 7.3 6.7 7.6 8 8C9.3 8.4 10.2 8.7 10.2 9.6C10.2 10.5 9.3 11 8 11C6.7 11 5.8 10.5 5.8 9.7" }, line)),
+    h("path", Object.assign({ d: "M8 3.6V5M8 11V12.4" }, line)));
+}
+
+// One dt/dd pair of the details grid.
+function KV(k, v) {
+  return [h("dt", { style: S.dt, key: k + ":k" }, k), h("dd", { style: S.dd, key: k + ":v" }, v)];
+}
+
+var EMPTY_LIST = { projectionsBySession: {} };
+var noSubscribe = function () { return function () {}; };
+var emptySnapshot = function () { return EMPTY_LIST; };
+
+function CostPill(props) {
+  var own = props.useProjection("sessionCost");
+  var catalog = props.useProjection("subagentCatalog");
+  var stats = props.useProjection("sessionStats");
+  var pressure = props.useProjection("contextPressure");
+
+  // Other sessions' projections (subagents) come from the sessions list snapshot.
+  var sessions = props.sessions;
+  var list = React.useSyncExternalStore(
+    sessions && sessions.list ? sessions.list.subscribe : noSubscribe,
+    sessions && sessions.list ? sessions.list.getSnapshot : emptySnapshot);
+  var bySession = (list && list.projectionsBySession) || {};
+  var valuesOf = function (id) { var p = bySession[id]; return p && p.values; };
+  var tree = collectTree({ sessionCost: own, subagentCatalog: catalog }, valuesOf);
+
+  // Ask the host for children whose projections are not loaded yet (once per id).
+  var requested = React.useRef({});
+  var pendingKey = tree.pending.join(",");
+  React.useEffect(function () {
+    if (!sessions || !sessions.refreshProjections) return;
+    tree.pending.forEach(function (id) {
+      if (requested.current[id]) return;
+      requested.current[id] = true;
+      try { Promise.resolve(sessions.refreshProjections(id)).catch(function () { requested.current[id] = false; }); }
+      catch (e) { requested.current[id] = false; }
+    });
+  }, [pendingKey, sessions]);
+
+  // All hooks run before any early return.
+  var st = React.useState(false);
+  var open = st[0], setOpen = st[1];
+  var rootRef = React.useRef(null);
+  var panelRef = React.useRef(null);
+  var pos = prim.useAnchoredPosition({ open: open, anchorRef: rootRef, panelRef: panelRef, side: "top", gap: 8, margin: 12 });
+  prim.useDismissOnOutsidePointer(rootRef, open, setOpen, panelRef);
+  React.useEffect(function () {
+    if (!open) return undefined;
+    var onKey = function (e) { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("keydown", onKey);
+    return function () { document.removeEventListener("keydown", onKey); };
+  }, [open]);
+
+  var rows = mergeRows(tree.own.concat(tree.subs));
+  if (rows.length === 0) return null;
+
+  var all = sumCost(rows), mine = sumCost(tree.own), sub = sumCost(tree.subs);
+  var incomplete = all.unpriced || tree.pending.length > 0;
+  var head = all.total === 0 && all.unpriced ? "$?" : "~" + usd(all.total) + (incomplete ? "+" : "");
+
+  var panel = null;
+  if (open) {
+    var th = function (t, left) { return h("th", { style: left ? Object.assign({}, S.th, { textAlign: "left", paddingLeft: 0 }) : S.th, key: t }, t); };
+    var table = h("table", { style: S.table },
+      h("thead", null, h("tr", null, th("model", true), th("in"), th("out"), th("cache r/w"), th("cost"))),
+      h("tbody", null, rows.map(function (r) {
+        return h("tr", { key: r.provider + "/" + r.model },
+          h("td", { style: Object.assign({}, S.tl, { overflowWrap: "anywhere" }), title: r.provider + "/" + r.model }, r.model),
+          h("td", { style: S.td }, fmtN(r.input)), h("td", { style: S.td }, fmtN(r.output)),
+          h("td", { style: S.td }, fmtN(r.cacheRead) + "/" + fmtN(r.cacheWrite)),
+          h("td", { style: S.td }, r.cost === null ? "no price" : usd(r.cost)));
+      })));
+
+    var info = [];
+    if (tree.count > 0) {
+      info.push(KV("main session", usd(mine.total)));
+      info.push(KV("subagents (" + tree.count + ")", usd(sub.total)));
+    }
+    var saved = 0, noCacheTotal = 0;
+    rows.forEach(function (r) {
+      if (r.cost === null || !r.price) return;
+      var noCache = (r.input + r.cacheRead + r.cacheWrite) * r.price[0] / 1e6 + r.output * r.price[1] / 1e6;
+      noCacheTotal += noCache; saved += Math.max(0, noCache - r.cost);
+    });
+    if (saved > 0) info.push(KV("saved by cache", usd(saved) + " (" + usd(noCacheTotal) + " without)"));
+    var outCost = 0;
+    rows.forEach(function (r) { if (r.cost !== null && r.price) outCost += r.output * r.price[1] / 1e6; });
+    if (all.total > 0) info.push(KV("output share of cost", Math.round(100 * outCost / all.total) + "%"));
+    if (stats && stats.turns > 0) {
+      info.push(KV("per turn", usd(mine.total / stats.turns) + " (" + stats.turns + " turns)"));
+      if (stats.steps > 0) info.push(KV("per step", usd(mine.total / stats.steps) + " (" + stats.steps + " steps)"));
+      info.push(KV("model time", fmtMs(stats.llmMs)));
+      info.push(KV("tool time", fmtMs(stats.toolMs)));
+      if (stats.decodeMs > 0) info.push(KV("output speed", (stats.decodeTokens / (stats.decodeMs / 1000)).toFixed(1) + " tok/s"));
+      if (stats.ttftSteps > 0) info.push(KV("avg time to first token", fmtMs(stats.ttftMs / stats.ttftSteps)));
+      if (stats.llmMs > 0) info.push(KV("burn rate", usd(mine.total / (stats.llmMs / 3.6e6)) + "/h of model time"));
+    }
+    if (pressure && pressure.contextWindow) {
+      var cur = pressure.pressureTokens || pressure.projectedTokens || 0;
+      info.push(KV("context", fmtN(cur) + " / " + fmtN(pressure.contextWindow) + " (" + Math.round(100 * cur / pressure.contextWindow) + "%)"));
+    }
+
+    var notes = ["Each request is priced at the model that answered it."];
+    if (all.unpriced) notes.push("Some models have no models.dev price and are not counted.");
+    if (tree.pending.length > 0) notes.push(tree.pending.length + " subagent(s) not loaded yet, their cost is not included.");
+    if (tree.external > 0) notes.push(tree.external + " external subagent(s) are not counted.");
+
+    panel = ReactDOM.createPortal(
+      h("div", { ref: panelRef, role: "dialog", "aria-label": "Session cost", style: Object.assign({}, S.panel, pos || S.measure) },
+        h("div", { style: S.title },
+          h("span", { style: S.titleLabel }, h(CoinIcon), "Session cost"),
+          h("span", { style: S.num }, usd(all.total) + (incomplete ? "+" : ""))),
+        h("div", { style: S.rule, "aria-hidden": true }),
+        table,
+        h("dl", { style: S.details }, info),
+        h("div", { style: S.note }, notes.join(" "))),
+      document.body);
+  }
+
+  var label = "Session cost " + head;
+  var button = h("button", { type: "button", className: "dsh-cost-pill", "aria-haspopup": "dialog",
+    "aria-expanded": open, "aria-label": label, onClick: function () { setOpen(!open); } }, h(CoinIcon), head);
+  var tipLabel = all.unpriced ? "Estimated cost; some models have no models.dev price" : "Estimated session cost";
+
+  return h("div", { style: S.root, "data-composer-cost": true },
+    h("span", { ref: rootRef, style: S.anchor },
+      h(prim.Tooltip, { label: tipLabel, side: "top", delayMs: 200, disabled: open }, button),
+      panel));
+}
+
+var name = "dsh-cost";
+var inject = ["slots", "sessions"];
+
+function apply(ctx) {
+  ctx.effect(function* () {
+    var style = document.createElement("style");
+    style.dataset.plugin = "dsh-cost-plugin";
+    style.textContent = CSS;
+    document.head.appendChild(style);
+    yield function () { style.remove(); };
+    yield ctx.slots.inject("conversation.composer.dock", function () {
+      return ctx.slots.register(
+        { name: "conversation.composer.dock", id: "dsh-cost", order: 10 },
+        function CostDock(props) { return h(CostPill, Object.assign({ sessions: ctx.sessions }, props)); }
+      );
+    });
+  }, "dsh-cost-plugin client lifecycle");
+}
+
+module.exports = { name: name, inject: inject, apply: apply, CostPill: CostPill, mergeRows: mergeRows, collectTree: collectTree, usd: usd };

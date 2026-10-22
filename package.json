@@ -1,0 +1,28 @@
+{
+  "name": "dsh-cost-plugin",
+  "version": "0.1.0",
+  "description": "Session cost estimate (USD) under the composer, priced from models.dev",
+  "keywords": ["deepseek-harness", "dsh", "cordis", "plugin", "cost", "ui"],
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": { "default": "./lib/index.js" },
+    "./client": { "default": "./lib/client.js" },
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "prices.json", "cordis.patch.yml"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "prices": "node scripts/update-prices.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/"
+  }
+}

@@ -1,0 +1,5 @@
+# One row, dual-face: node half = lib/index.js (no-op), browser half = ./client
+# via the `dsh.client` declaration. The row name MUST equal the package name.
+- insert:
+    - id: dsh-cost-plugin
+      name: 'dsh-cost-plugin'
